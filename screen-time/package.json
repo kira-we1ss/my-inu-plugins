@@ -1,0 +1,18 @@
+{
+  "name": "screen-time",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "inu": "tsx node_modules/@inugram/cli/src/cli.ts",
+    "build": "tsx node_modules/@inugram/cli/src/cli.ts build",
+    "check": "tsx node_modules/@inugram/cli/src/cli.ts check",
+    "dev": "tsx node_modules/@inugram/cli/src/cli.ts dev",
+    "push": "tsx node_modules/@inugram/cli/src/cli.ts push"
+  },
+  "devDependencies": {
+    "@inugram/cli": "file:/home/kweiss/Projects/inugram/sdk/cli",
+    "@inugram/plugin-types": "file:/home/kweiss/Projects/inugram/sdk/types",
+    "tsx": "^4.20.6",
+    "typescript": "^5.9.3"
+  }
+}
