@@ -3,21 +3,27 @@ type ScreenType = 'chat' | 'profile' | 'dialogs' | 'settings' | 'other'
 interface DayRecord {
   /** ms per screen type */
   s: Record<string, number>
-  /** ms per chat (marked peer id as string) */
+  /** ms per chat (marked peer id as string), including time spent in its topics */
   c: Record<string, number>
+  /** ms per forum topic (`{marked peer id}:{topic id}`) */
+  t: Record<string, number>
 }
 
 interface Session {
   slot: number
   type: ScreenType
   dialogId: number | null
+  topicId: number | null
   startMs: number
 }
 
 const RETENTION_DAYS = 30
 const FLUSH_INTERVAL_MS = 30_000
-const TOP_CHATS = 10
+const COLLAPSED_CHATS = 10
 const BAR_WIDTH = 12
+const GENERAL_TOPIC_ID = 1
+/** time in a forum outside any topic (e.g. the topic list) shorter than this is not worth a row */
+const MIN_REMAINDER_MS = 1000
 
 const SCREEN_LABELS: Record<ScreenType, string> = {
   chat: 'Чаты',
@@ -50,14 +56,18 @@ function storageKey(slot: number, day: string): string {
 }
 
 function emptyRecord(): DayRecord {
-  return { s: {}, c: {} }
+  return { s: {}, c: {}, t: {} }
 }
 
-function addTo(record: DayRecord, type: ScreenType, dialogId: number | null, ms: number) {
+function addTo(record: DayRecord, type: ScreenType, dialogId: number | null, topicId: number | null, ms: number) {
   record.s[type] = (record.s[type] ?? 0) + ms
   if (dialogId !== null) {
     const key = String(dialogId)
     record.c[key] = (record.c[key] ?? 0) + ms
+    if (topicId !== null) {
+      const topicKey = `${dialogId}:${topicId}`
+      record.t[topicKey] = (record.t[topicKey] ?? 0) + ms
+    }
   }
 }
 
@@ -68,6 +78,9 @@ function mergeInto(target: DayRecord, source: DayRecord) {
   for (const [id, ms] of Object.entries(source.c)) {
     target.c[id] = (target.c[id] ?? 0) + ms
   }
+  for (const [id, ms] of Object.entries(source.t)) {
+    target.t[id] = (target.t[id] ?? 0) + ms
+  }
 }
 
 function readStored(key: string): DayRecord {
@@ -75,7 +88,7 @@ function readStored(key: string): DayRecord {
   if (raw === null) return emptyRecord()
   try {
     const parsed = JSON.parse(raw) as Partial<DayRecord>
-    return { s: parsed.s ?? {}, c: parsed.c ?? {} }
+    return { s: parsed.s ?? {}, c: parsed.c ?? {}, t: parsed.t ?? {} }
   } catch (error) {
     console.warn(`screen-time: dropping unreadable record ${key}:`, error)
     return emptyRecord()
@@ -85,7 +98,14 @@ function readStored(key: string): DayRecord {
 /** accumulated since the last flush, keyed like localStorage (`d:{slot}:{day}`) */
 const pending = new Map<string, DayRecord>()
 
-function accumulate(slot: number, type: ScreenType, dialogId: number | null, fromMs: number, toMs: number) {
+function accumulate(
+  slot: number,
+  type: ScreenType,
+  dialogId: number | null,
+  topicId: number | null,
+  fromMs: number,
+  toMs: number,
+) {
   let cursor = fromMs
   while (cursor < toMs) {
     const boundary = Math.min(nextMidnight(cursor), toMs)
@@ -95,7 +115,7 @@ function accumulate(slot: number, type: ScreenType, dialogId: number | null, fro
       record = emptyRecord()
       pending.set(key, record)
     }
-    addTo(record, type, dialogId, boundary - cursor)
+    addTo(record, type, dialogId, topicId, boundary - cursor)
     cursor = boundary
   }
 }
@@ -125,13 +145,14 @@ function flush() {
 
 // --- tracking ---
 
-let visible = false
+/** the app was explicitly backgrounded or paused; screen changes are ignored until it returns */
+let suspended = false
 let current: Session | null = null
 
 function closeSession(nowMs: number) {
   if (current === null) return
   if (nowMs > current.startMs) {
-    accumulate(current.slot, current.type, current.dialogId, current.startMs, nowMs)
+    accumulate(current.slot, current.type, current.dialogId, current.topicId, current.startMs, nowMs)
   }
   current = null
 }
@@ -143,18 +164,17 @@ function openSession(screen: inu.ui.CurrentScreen | null, nowMs: number) {
     slot: screen.account.id,
     type: screen.type,
     dialogId: isPeerScreen && typeof screen.dialogId === 'number' ? screen.dialogId : null,
+    topicId: screen.type === 'chat' && typeof screen.topicId === 'number' ? screen.topicId : null,
     startMs: nowMs,
   }
 }
 
 {
-  const initial = inu.ui.getCurrentScreen()
-  visible = initial !== null
-  if (visible) openSession(initial, Date.now())
+  openSession(inu.ui.getCurrentScreen(), Date.now())
 }
 
 inu.ui.onScreenChanged((change) => {
-  if (!visible) return
+  if (suspended) return
   const now = Date.now()
   closeSession(now)
   openSession(change.screen, now)
@@ -163,11 +183,11 @@ inu.ui.onScreenChanged((change) => {
 
 inu.onAppVisibilityChange((mode) => {
   if (mode === 'background' || mode === 'paused') {
-    visible = false
+    suspended = true
     closeSession(Date.now())
     flush()
   } else {
-    visible = true
+    suspended = false
     closeSession(Date.now())
     openSession(inu.ui.getCurrentScreen(), Date.now())
     flush()
@@ -216,6 +236,51 @@ function chatLabel(slot: number, dialogId: number): string {
   return localStorage.getItem(`n:${slot}:${dialogId}`) ?? `#${dialogId}`
 }
 
+function topicLabel(slot: number, dialogId: number, topicId: number): string {
+  const account = accountOrNull(slot)
+  if (account !== null) {
+    const topic = account.getTopicCached(dialogId, topicId)
+    if (topic !== null && topic._ === 'forumTopic' && topic.title !== '') {
+      localStorage.setItem(`n:${slot}:${dialogId}:${topicId}`, topic.title)
+      return topic.title
+    }
+  }
+  const fallback = topicId === GENERAL_TOPIC_ID ? 'Общий' : `Топик #${topicId}`
+  return localStorage.getItem(`n:${slot}:${dialogId}:${topicId}`) ?? fallback
+}
+
+/** a custom emoji id is a 64-bit number; `0`/empty mean "none" */
+function emojiIconOrUndefined(id: string): inu.UIIcon | undefined {
+  if (id === '' || id === '0') return undefined
+  try {
+    return inu.icons.customEmoji(id)
+  } catch (error) {
+    // an icon that fails must not take the whole page down with it
+    console.warn(`screen-time: bad custom emoji id ${id}:`, error)
+    return undefined
+  }
+}
+
+/** the topic's custom emoji, if it has one; remembered like names so it survives a cache miss */
+function topicIcon(slot: number, dialogId: number, topicId: number): inu.UIIcon | undefined {
+  const cacheKey = `n:${slot}:${dialogId}:${topicId}:icon`
+  const account = accountOrNull(slot)
+  if (account !== null) {
+    const topic = account.getTopicCached(dialogId, topicId)
+    if (topic !== null && topic._ === 'forumTopic') {
+      // typed as a string, but the runtime hands over a number (`0` when the topic has no emoji)
+      const emojiId = topic.icon_emoji_id == null ? '' : String(topic.icon_emoji_id)
+      if (emojiId !== '' && emojiId !== '0') {
+        localStorage.setItem(cacheKey, emojiId)
+      } else {
+        localStorage.removeItem(cacheKey)
+      }
+      return emojiIconOrUndefined(emojiId)
+    }
+  }
+  return emojiIconOrUndefined(localStorage.getItem(cacheKey) ?? '')
+}
+
 function accountLabel(slot: number): string {
   const account = accountOrNull(slot)
   if (account === null) return `Аккаунт ${slot} (удалён)`
@@ -243,6 +308,8 @@ interface Totals {
   screens: Map<ScreenType, number>
   /** `${slot}:${dialogId}` -> ms */
   chats: Map<string, number>
+  /** `${slot}:${dialogId}` -> topic id -> ms */
+  topics: Map<string, Map<number, number>>
   total: number
 }
 
@@ -255,7 +322,7 @@ function aggregate(period: number, slotFilter: number): Totals {
   }
   const slots = slotFilter >= 0 ? [slotFilter] : knownSlots()
 
-  const totals: Totals = { screens: new Map(), chats: new Map(), total: 0 }
+  const totals: Totals = { screens: new Map(), chats: new Map(), topics: new Map(), total: 0 }
   const absorb = (slot: number, record: DayRecord) => {
     for (const [type, ms] of Object.entries(record.s)) {
       totals.screens.set(type as ScreenType, (totals.screens.get(type as ScreenType) ?? 0) + ms)
@@ -264,6 +331,17 @@ function aggregate(period: number, slotFilter: number): Totals {
     for (const [id, ms] of Object.entries(record.c)) {
       const key = `${slot}:${id}`
       totals.chats.set(key, (totals.chats.get(key) ?? 0) + ms)
+    }
+    for (const [id, ms] of Object.entries(record.t)) {
+      const sep = id.indexOf(':')
+      const chatKey = `${slot}:${id.slice(0, sep)}`
+      const topicId = Number(id.slice(sep + 1))
+      let byTopic = totals.topics.get(chatKey)
+      if (byTopic === undefined) {
+        byTopic = new Map()
+        totals.topics.set(chatKey, byTopic)
+      }
+      byTopic.set(topicId, (byTopic.get(topicId) ?? 0) + ms)
     }
   }
   for (const slot of slots) {
@@ -285,7 +363,7 @@ function aggregate(period: number, slotFilter: number): Totals {
 
 function accumulateIntoLive(record: DayRecord, session: Session, nowMs: number) {
   if (dayKeyOf(session.startMs) === dayKeyOf(nowMs)) {
-    addTo(record, session.type, session.dialogId, nowMs - session.startMs)
+    addTo(record, session.type, session.dialogId, session.topicId, nowMs - session.startMs)
   }
   // a live session that crosses midnight is rare and only skews the "7 days"
   // view by where its elapsed part lands; the flush path splits it exactly
@@ -317,6 +395,47 @@ function bar(ms: number, of: number): string {
 const uiState = {
   period: Math.min(Math.max(Number(localStorage.getItem('ui:period') ?? '0'), 0), PERIODS.length - 1),
   account: Number(localStorage.getItem('ui:account') ?? '-1'),
+  showAllChats: false,
+  /** chat keys (`${slot}:${dialogId}`) whose topics are unfolded */
+  expanded: new Set<string>(),
+}
+
+function openChat(slot: number, dialogId: number, topicId?: number) {
+  try {
+    inu.ui.openPage({ type: 'chat', dialogId, topicId, account: slot })
+  } catch (error) {
+    console.warn(`screen-time: cannot open chat ${dialogId} (topic ${topicId}) on slot ${slot}:`, error)
+    inu.ui.toast('Не удалось открыть чат')
+  }
+}
+
+/** rows under an unfolded forum chat: its topics, then whatever was spent outside any topic */
+function topicItems(slot: number, dialogId: number, chatMs: number, byTopic: Map<number, number>): inu.UIElement[] {
+  const rows: inu.UIElement[] = []
+  const sorted = [...byTopic.entries()].sort((a, b) => b[1] - a[1])
+  let inTopics = 0
+  for (const [, ms] of sorted) inTopics += ms
+  for (const [topicId, ms] of sorted) {
+    rows.push(inu.ui.button({
+      id: `topic:${slot}:${dialogId}:${topicId}`,
+      text: topicLabel(slot, dialogId, topicId),
+      icon: topicIcon(slot, dialogId, topicId),
+      subtitle: bar(ms, chatMs),
+      value: formatMs(ms),
+      onClick: () => openChat(slot, dialogId, topicId),
+    }))
+  }
+  const outside = chatMs - inTopics
+  if (outside >= MIN_REMAINDER_MS) {
+    rows.push(inu.ui.button({
+      id: `topic:${slot}:${dialogId}:outside`,
+      text: 'Вне топиков',
+      subtitle: bar(outside, chatMs),
+      value: formatMs(outside),
+      onClick: () => {},
+    }))
+  }
+  return rows
 }
 
 function dashboardItems(): inu.UIElement[] {
@@ -377,26 +496,50 @@ function dashboardItems(): inu.UIElement[] {
       }))
     }
     if (totals.chats.size > 0) {
-      items.push(inu.ui.header('Топ чатов'))
-      const chats = [...totals.chats.entries()].sort((a, b) => b[1] - a[1]).slice(0, TOP_CHATS)
+      items.push(inu.ui.header('Чаты'))
+      const allChats = [...totals.chats.entries()].sort((a, b) => b[1] - a[1])
+      const chats = uiState.showAllChats ? allChats : allChats.slice(0, COLLAPSED_CHATS)
       const topMs = chats[0][1]
       for (const [key, ms] of chats) {
         const sep = key.indexOf(':')
         const slot = Number(key.slice(0, sep))
         const dialogId = Number(key.slice(sep + 1))
+        const byTopic = totals.topics.get(key)
+        if (byTopic === undefined) {
+          items.push(inu.ui.button({
+            id: `chat:${key}`,
+            text: chatLabel(slot, dialogId),
+            subtitle: bar(ms, topMs),
+            value: formatMs(ms),
+            icon: inu.icons.avatar(dialogId, { account: slot }),
+            onClick: () => openChat(slot, dialogId),
+          }))
+          continue
+        }
+        // a forum: tap unfolds its topics, long tap opens the chat itself
+        const open = uiState.expanded.has(key)
         items.push(inu.ui.button({
           id: `chat:${key}`,
-          text: chatLabel(slot, dialogId),
+          text: `${open ? '▾' : '▸'} ${chatLabel(slot, dialogId)}`,
           subtitle: bar(ms, topMs),
           value: formatMs(ms),
           icon: inu.icons.avatar(dialogId, { account: slot }),
           onClick: () => {
-            try {
-              inu.ui.openPage({ type: 'chat', dialogId, account: slot })
-            } catch (error) {
-              console.warn(`screen-time: cannot open chat ${dialogId} on slot ${slot}:`, error)
-              inu.ui.toast('Не удалось открыть чат')
-            }
+            if (open) uiState.expanded.delete(key)
+            else uiState.expanded.add(key)
+            page.invalidate()
+          },
+          onSecondaryClick: () => openChat(slot, dialogId),
+        }))
+        if (open) items.push(...topicItems(slot, dialogId, ms, byTopic))
+      }
+      if (allChats.length > COLLAPSED_CHATS) {
+        items.push(inu.ui.button({
+          id: 'toggle-chats',
+          text: uiState.showAllChats ? 'Свернуть список' : `Показать все чаты (${allChats.length})`,
+          onClick: () => {
+            uiState.showAllChats = !uiState.showAllChats
+            page.invalidate()
           },
         }))
       }
