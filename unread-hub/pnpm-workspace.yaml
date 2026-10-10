@@ -1,0 +1,5 @@
+allowBuilds:
+  esbuild: set this to true or false
+minimumReleaseAgeExclude:
+  - '@inugram/cli@44.0.0'
+  - '@inugram/plugin-types@44.0.0'
