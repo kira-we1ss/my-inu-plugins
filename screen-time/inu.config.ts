@@ -8,7 +8,7 @@ export default defineConfig({
         id: 'local.kweiss.screen-time',
         name: 'Screen Time',
         author: 'kweiss',
-        version: '1.0.0',
+        version: '1.0.1',
         description: {
           en: 'Tracks time spent in the app, per screen type and per chat. All data stays on device.',
           ru: 'Считает время, проведённое в приложении: по типам экранов и по чатам. Данные хранятся только локально.',
